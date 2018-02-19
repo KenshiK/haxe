@@ -350,14 +350,14 @@ let gen_constant ctx p = function
 	| TBool b -> spr ctx (if b then "true" else "false")
 	| TNull -> spr ctx "null"
 	| TThis -> spr ctx (this ctx)
-	| TSuper -> assert false
+	| TSuper -> assert (ctx.es_version >= 6); spr ctx "super"
 
 let print_deprecation_message com msg p =
 	com.warning msg p
 
 let rec gen_call ctx e el in_value =
 	match e.eexpr , el with
-	| TConst TSuper , params ->
+	| TConst TSuper, params when ctx.es_version < 6 ->
 		(match ctx.current.cl_super with
 		| None -> abort "Missing api.setCurrentClass" e.epos
 		| Some (c,_) ->
@@ -365,7 +365,7 @@ let rec gen_call ctx e el in_value =
 			List.iter (fun p -> print ctx ","; gen_value ctx p) params;
 			spr ctx ")";
 		);
-	| TField ({ eexpr = TConst TSuper },f) , params ->
+	| TField ({ eexpr = TConst TSuper },f), params when ctx.es_version < 6 ->
 		(match ctx.current.cl_super with
 		| None -> abort "Missing api.setCurrentClass" e.epos
 		| Some (c,_) ->
@@ -588,18 +588,7 @@ and gen_expr ctx e =
 		newline ctx;
 		print ctx "}";
 	| TFunction f ->
-		let old = ctx.in_value, ctx.in_loop in
-		ctx.in_value <- None;
-		ctx.in_loop <- false;
-		let args = List.map (fun (v,_) ->
-			check_var_declaration v;
-			ident v.v_name
-		) f.tf_args in
-		print ctx "function(%s) " (String.concat "," args);
-		gen_expr ctx (fun_block ctx f e.epos);
-		ctx.in_value <- fst old;
-		ctx.in_loop <- snd old;
-		ctx.separator <- true
+		gen_function ctx f e.epos
 	| TCall (e,el) ->
 		gen_call ctx e el false
 	| TArrayDecl el ->
@@ -752,6 +741,20 @@ and gen_expr ctx e =
 		spr ctx s
 	);
 	clear_mapping ()
+
+and gen_function ?(keyword="function") ctx f pos =
+	let old = ctx.in_value, ctx.in_loop in
+	ctx.in_value <- None;
+	ctx.in_loop <- false;
+	let args = List.map (fun (v,_) ->
+		check_var_declaration v;
+		ident v.v_name
+	) f.tf_args in
+	print ctx "%s(%s) " keyword (String.concat "," args);
+	gen_expr ctx (fun_block ctx f pos);
+	ctx.in_value <- fst old;
+	ctx.in_loop <- snd old;
+	ctx.separator <- true
 
 and gen_block_element ?(after=false) ctx e =
 	match e.eexpr with
@@ -1056,12 +1059,7 @@ let generate_class___name__ ctx c =
 		newline ctx;
 	end
 
-let generate_class ctx c =
-	ctx.current <- c;
-	ctx.id_counter <- 0;
-	(match c.cl_path with
-	| [],"Function" -> abort "This class redefine a native one" c.cl_pos
-	| _ -> ());
+let generate_class_es3 ctx c =
 	let p = s_path ctx c.cl_path in
 	let hxClasses = has_feature ctx "Type.resolveClass" in
 	if ctx.js_flatten then
@@ -1147,7 +1145,134 @@ let generate_class ctx c =
 		print ctx "\n}";
 		(match c.cl_super with None -> ctx.separator <- true | _ -> print ctx ")");
 		newline ctx
+	end
+
+let generate_class_es6 ctx c =
+	let p = s_path ctx c.cl_path in
+	let hxClasses = has_feature ctx "Type.resolveClass" in
+	if ctx.js_flatten then
+		print ctx "var "
+	else
+		generate_package_create ctx c.cl_path;
+	if ctx.js_modern || not hxClasses then
+		print ctx "%s = " p
+	else
+		print ctx "%s = $hxClasses[\"%s\"] = " p (dot_path c.cl_path);
+	(match (get_exposed ctx (dot_path c.cl_path) c.cl_meta) with [s] -> print ctx "$hx_exports%s = " (path_to_brackets s) | _ -> ());
+
+	spr ctx "class";
+
+	Option.may (fun (csup,_) ->
+		let psup = ctx.type_accessor (TClassDecl csup) in
+		print ctx " extends %s" psup
+	) c.cl_super;
+	spr ctx " {";
+	let close_block = open_block ctx in
+
+	(match c.cl_constructor with
+	| Some { cf_expr = Some ({ eexpr = TFunction f; epos = p }) } ->
+		newline ctx;
+		gen_function ~keyword:"constructor" ctx f p;
+		ctx.separator <- false
+	| _ -> ());
+
+	let nonmethod_fields =
+		List.filter (fun cf ->
+			match cf.cf_kind, cf.cf_expr with
+			| Method (MethNormal | MethInline), Some { eexpr = TFunction f; epos = pos } ->
+				check_field_name c cf;
+				newline ctx;
+				gen_function ~keyword:cf.cf_name ctx f pos;
+				ctx.separator <- false;
+				false
+			| _ -> true
+		) c.cl_ordered_fields
+	in
+
+	let nonmethod_statics =
+		List.filter (fun cf ->
+			match cf.cf_kind, cf.cf_expr with
+			| Method (MethNormal | MethInline), Some { eexpr = TFunction f; epos = pos } ->
+				check_field_name c cf;
+				newline ctx;
+				gen_function ~keyword:("static " ^ cf.cf_name) ctx f pos;
+				ctx.separator <- false;
+				false
+			| _ -> true
+		) c.cl_ordered_statics
+	in
+
+	close_block ();
+	print ctx "\n}";
+	newline ctx;
+
+	List.iter (gen_class_static_field ctx c) nonmethod_statics;
+
+	if ctx.js_modern && hxClasses then begin
+		print ctx "$hxClasses[\"%s\"] = %s" (dot_path c.cl_path) p;
+		newline ctx;
 	end;
+	generate_class___name__ ctx c;
+	(match c.cl_implements with
+	| [] -> ()
+	| l ->
+		print ctx "%s.__interfaces__ = [%s]" p (String.concat "," (List.map (fun (i,_) -> ctx.type_accessor (TClassDecl i)) l));
+		newline ctx;
+	);
+
+	let gen_props props =
+		String.concat "," (List.map (fun (p,v) -> p ^":\""^v^"\"") props)
+	in
+	let has_property_reflection =
+		(has_feature ctx "Reflect.getProperty") || (has_feature ctx "Reflect.setProperty") in
+
+	if has_property_reflection then begin
+		(match Codegen.get_properties c.cl_ordered_statics with
+		| [] -> ()
+		| props ->
+			print ctx "%s.__properties__ = {%s}" p (gen_props props);
+			ctx.separator <- true;
+			newline ctx);
+	end;
+
+	let has_class = has_feature ctx "js.Boot.getClass" && (c.cl_super <> None || c.cl_ordered_fields <> [] || c.cl_constructor <> None) in
+	let props = if has_property_reflection then Codegen.get_properties nonmethod_fields else [] in
+	let has_prototype = c.cl_super <> None || has_class || List.exists (can_gen_class_field ctx) nonmethod_fields || props <> [] in
+	if has_prototype then begin
+		print ctx "Object.assign(%s.prototype, {" p;
+		let bend = open_block ctx in
+		List.iter (fun f -> if can_gen_class_field ctx f then gen_class_field ctx c f) nonmethod_fields;
+		if has_class then begin
+			newprop ctx;
+			print ctx "__class__: %s" p;
+		end;
+		if has_property_reflection then begin
+			(match c.cl_super with
+			| _ when props = [] -> ()
+			| Some (csup,_) when Codegen.has_properties csup ->
+				newprop ctx;
+				let psup = ctx.type_accessor (TClassDecl csup) in
+				print ctx "__properties__: Object.assign({}, %s.prototype.__properties__,{%s})" psup (gen_props props)
+			| _ ->
+				newprop ctx;
+				print ctx "__properties__: {%s}" (gen_props props));
+		end;
+
+		bend();
+		print ctx "\n});";
+		newline ctx
+	end
+
+let generate_class ctx c =
+	ctx.current <- c;
+	ctx.id_counter <- 0;
+	(match c.cl_path with
+	| [],"Function" -> abort "This class redefine a native one" c.cl_pos
+	| _ -> ());
+	if ctx.es_version >= 6 then
+		generate_class_es6 ctx c
+	else
+		generate_class_es3 ctx c;
 	flush ctx
 
 let generate_enum ctx e =
