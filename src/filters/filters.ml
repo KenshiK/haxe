@@ -897,7 +897,11 @@ let run com tctx main =
 	] in
 	let type_filters = match com.platform with
 		| Cs -> type_filters @ [ fun _ t -> InterfaceProps.run t ]
-		| Js -> JsExceptions.inject_callstack com type_filters
+		| Js ->
+			let mark, change = JsCtors.make_filters com in
+			List.iter mark com.types;
+			let type_filters = JsExceptions.inject_callstack com type_filters in
+			type_filters @ [change]
 		| _ -> type_filters
 	in
 	let t = filter_timer detail_times ["type 3"] in

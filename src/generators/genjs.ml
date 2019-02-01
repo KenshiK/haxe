@@ -737,6 +737,8 @@ and gen_expr ctx e =
 		spr ctx " , ";
 		spr ctx (ctx.type_accessor t);
 		spr ctx ")"
+	| TIdent "__empty_ctor_check__" ->
+		spr ctx "if (arguments.length === 1 && arguments[0] === EMPTY) return;"
 	| TIdent s ->
 		spr ctx s
 	);
@@ -1606,6 +1608,9 @@ let generate com =
 
 	if (not ctx.js_modern) && (ctx.es_version < 5) then
 		spr ctx "var console = $global.console || {log:function(){}};\n";
+
+	if Common.has_feature com "js.empty" then
+		spr ctx "const EMPTY = {};\n";
 
 	let enums_as_objects = not (Common.defined com Define.JsEnumsAsArrays) in
 
